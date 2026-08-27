@@ -1,71 +1,64 @@
 package jina
 
 import (
-	"github.com/go-skynet/LocalAI/core/backend"
-	"github.com/go-skynet/LocalAI/core/config"
+	"net/http"
 
-	fiberContext "github.com/go-skynet/LocalAI/core/http/ctx"
-	"github.com/go-skynet/LocalAI/core/schema"
-	"github.com/go-skynet/LocalAI/pkg/grpc/proto"
-	"github.com/go-skynet/LocalAI/pkg/model"
-	"github.com/gofiber/fiber/v2"
-	"github.com/rs/zerolog/log"
+	"github.com/labstack/echo/v4"
+	"github.com/mudler/LocalAI/core/backend"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/middleware"
+	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/pkg/grpc/proto"
+	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/xlog"
 )
 
-func JINARerankEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		req := new(schema.JINARerankRequest)
-		if err := c.BodyParser(req); err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Cannot parse JSON",
-			})
+// JINARerankEndpoint acts like the Jina reranker endpoint (https://jina.ai/reranker/)
+// @Summary Reranks a list of phrases by relevance to a given text query.
+// @Tags rerank
+// @Param request body schema.JINARerankRequest true "query params"
+// @Success 200 {object} schema.JINARerankResponse "Response"
+// @Router /v1/rerank [post]
+func JINARerankEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
+
+		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.JINARerankRequest)
+		if !ok || input.Model == "" {
+			return echo.ErrBadRequest
 		}
 
-		input := new(schema.TTSRequest)
-
-		// Get input data from the request body
-		if err := c.BodyParser(input); err != nil {
-			return err
+		cfg, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
+		if !ok || cfg == nil {
+			return echo.ErrBadRequest
 		}
 
-		modelFile, err := fiberContext.ModelFromContext(c, ml, input.Model, false)
-		if err != nil {
-			modelFile = input.Model
-			log.Warn().Msgf("Model not found in context: %s", input.Model)
-		}
-
-		cfg, err := cl.LoadBackendConfigFileByName(modelFile, appConfig.ModelPath,
-			config.LoadOptionDebug(appConfig.Debug),
-			config.LoadOptionThreads(appConfig.Threads),
-			config.LoadOptionContextSize(appConfig.ContextSize),
-			config.LoadOptionF16(appConfig.F16),
-		)
-
-		if err != nil {
-			modelFile = input.Model
-			log.Warn().Msgf("Model not found in context: %s", input.Model)
+		xlog.Debug("JINA Rerank Request received", "model", input.Model)
+		var requestTopN int32
+		docs := int32(len(input.Documents))
+		if input.TopN == nil { // omit top_n to get all
+			requestTopN = docs
 		} else {
-			modelFile = cfg.Model
+			requestTopN = int32(*input.TopN)
+			if requestTopN < 1 {
+				return c.JSON(http.StatusUnprocessableEntity, "top_n - should be greater than or equal to 1")
+			}
+			if requestTopN > docs { // make it more obvious for backends
+				requestTopN = docs
+			}
 		}
-		log.Debug().Msgf("Request for model: %s", modelFile)
-
-		if input.Backend != "" {
-			cfg.Backend = input.Backend
-		}
-
 		request := &proto.RerankRequest{
-			Query:     req.Query,
-			TopN:      int32(req.TopN),
-			Documents: req.Documents,
+			Query:     input.Query,
+			TopN:      requestTopN,
+			Documents: input.Documents,
 		}
 
-		results, err := backend.Rerank(cfg.Backend, modelFile, request, ml, appConfig, *cfg)
+		results, err := backend.Rerank(c.Request().Context(), request, ml, appConfig, *cfg)
 		if err != nil {
 			return err
 		}
 
 		response := &schema.JINARerankResponse{
-			Model: req.Model,
+			Model: input.Model,
 		}
 
 		for _, r := range results.Results {
@@ -79,6 +72,6 @@ func JINARerankEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, a
 		response.Usage.TotalTokens = int(results.Usage.TotalTokens)
 		response.Usage.PromptTokens = int(results.Usage.PromptTokens)
 
-		return c.Status(fiber.StatusOK).JSON(response)
+		return c.JSON(http.StatusOK, response)
 	}
 }

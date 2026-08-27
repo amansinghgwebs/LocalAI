@@ -2,6 +2,7 @@
 name: "llama3-instruct"
 
 config_file: |
+  backend: "llama-cpp"
   mmap: true
   template:
     chat_message: |
@@ -31,7 +32,7 @@ config_file: |
       {'title': 'FunctionCall', 'type': 'object', 'properties': {'arguments': {'title': 'Arguments', 'type': 'object'}, 'name': {'title': 'Name', 'type': 'string'}}, 'required': ['arguments', 'name']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
       Function call:
     chat: |
-      <|begin_of_text|>{{.Input }}
+      {{.Input }}
       <|start_header_id|>assistant<|end_header_id|>
     completion: |
       {{.Input}}

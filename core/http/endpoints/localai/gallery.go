@@ -3,56 +3,83 @@ package localai
 import (
 	"encoding/json"
 	"fmt"
-	"slices"
 
-	"github.com/go-skynet/LocalAI/core/services"
-	"github.com/go-skynet/LocalAI/pkg/gallery"
-	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"github.com/rs/zerolog/log"
+	"github.com/labstack/echo/v4"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/gallery"
+	"github.com/mudler/LocalAI/core/http/middleware"
+	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/core/services/galleryop"
+	"github.com/mudler/LocalAI/pkg/system"
+	"github.com/mudler/xlog"
 )
 
 type ModelGalleryEndpointService struct {
-	galleries      []gallery.Gallery
-	modelPath      string
-	galleryApplier *services.GalleryService
+	galleries        []config.Gallery
+	backendGalleries []config.Gallery
+	modelPath        string
+	galleryApplier   *galleryop.GalleryService
+	configLoader     *config.ModelConfigLoader
 }
 
 type GalleryModel struct {
-	ID        string `json:"id"`
-	ConfigURL string `json:"config_url"`
+	ID string `json:"id"`
+	// Variant installs one specific build of an entry that declares variants,
+	// named as it appears in the entry's `variants` list (see the `variants`
+	// and `auto_variant` fields of the gallery listing). Leave it empty to let
+	// LocalAI auto-select the largest build this host can actually run.
+	Variant string `json:"variant,omitempty"`
 	gallery.GalleryModel
 }
 
-func CreateModelGalleryEndpointService(galleries []gallery.Gallery, modelPath string, galleryApplier *services.GalleryService) ModelGalleryEndpointService {
+func CreateModelGalleryEndpointService(galleries []config.Gallery, backendGalleries []config.Gallery, systemState *system.SystemState, galleryApplier *galleryop.GalleryService, configLoader *config.ModelConfigLoader) ModelGalleryEndpointService {
 	return ModelGalleryEndpointService{
-		galleries:      galleries,
-		modelPath:      modelPath,
-		galleryApplier: galleryApplier,
+		galleries:        galleries,
+		backendGalleries: backendGalleries,
+		modelPath:        systemState.Model.ModelsPath,
+		galleryApplier:   galleryApplier,
+		configLoader:     configLoader,
 	}
 }
 
-func (mgs *ModelGalleryEndpointService) GetOpStatusEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		status := mgs.galleryApplier.GetStatus(c.Params("uuid"))
+// GetOpStatusEndpoint returns the job status
+// @Summary Returns the job status
+// @Tags models
+// @Success 200 {object} galleryop.OpStatus "Response"
+// @Router /models/jobs/{uuid} [get]
+func (mgs *ModelGalleryEndpointService) GetOpStatusEndpoint() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		status := mgs.galleryApplier.GetStatus(c.Param("uuid"))
 		if status == nil {
 			return fmt.Errorf("could not find any status for ID")
 		}
-		return c.JSON(status)
+		return c.JSON(200, status)
 	}
 }
 
-func (mgs *ModelGalleryEndpointService) GetAllStatusEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		return c.JSON(mgs.galleryApplier.GetAllStatus())
+// GetAllStatusEndpoint returns all the jobs status progress
+// @Summary Returns all the jobs status progress
+// @Tags models
+// @Success 200 {object} map[string]galleryop.OpStatus "Response"
+// @Router /models/jobs [get]
+func (mgs *ModelGalleryEndpointService) GetAllStatusEndpoint() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return c.JSON(200, mgs.galleryApplier.GetAllStatus())
 	}
 }
 
-func (mgs *ModelGalleryEndpointService) ApplyModelGalleryEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+// ApplyModelGalleryEndpoint installs a new model to a LocalAI instance from the model gallery
+// @Summary Install models to LocalAI.
+// @Tags models
+// @Param request body GalleryModel true "query params"
+// @Success 200 {object} schema.GalleryResponse "Response"
+// @Router /models/apply [post]
+func (mgs *ModelGalleryEndpointService) ApplyModelGalleryEndpoint() echo.HandlerFunc {
+	return func(c echo.Context) error {
 		input := new(GalleryModel)
 		// Get input data from the request body
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
@@ -60,110 +87,94 @@ func (mgs *ModelGalleryEndpointService) ApplyModelGalleryEndpoint() func(c *fibe
 		if err != nil {
 			return err
 		}
-		mgs.galleryApplier.C <- gallery.GalleryOp{
-			Req:              input.GalleryModel,
-			Id:               uuid.String(),
-			GalleryModelName: input.ID,
-			Galleries:        mgs.galleries,
-			ConfigURL:        input.ConfigURL,
-		}
-		return c.JSON(struct {
-			ID        string `json:"uuid"`
-			StatusURL string `json:"status"`
-		}{ID: uuid.String(), StatusURL: c.BaseURL() + "/models/jobs/" + uuid.String()})
-	}
-}
-
-func (mgs *ModelGalleryEndpointService) DeleteModelGalleryEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		modelName := c.Params("name")
-
-		mgs.galleryApplier.C <- gallery.GalleryOp{
-			Delete:           true,
-			GalleryModelName: modelName,
-		}
-
-		uuid, err := uuid.NewUUID()
-		if err != nil {
-			return err
-		}
-
-		return c.JSON(struct {
-			ID        string `json:"uuid"`
-			StatusURL string `json:"status"`
-		}{ID: uuid.String(), StatusURL: c.BaseURL() + "/models/jobs/" + uuid.String()})
-	}
-}
-
-func (mgs *ModelGalleryEndpointService) ListModelFromGalleryEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		log.Debug().Msgf("Listing models from galleries: %+v", mgs.galleries)
-
-		models, err := gallery.AvailableGalleryModels(mgs.galleries, mgs.modelPath)
-		if err != nil {
-			return err
-		}
-		log.Debug().Msgf("Models found from galleries: %+v", models)
-		for _, m := range models {
-			log.Debug().Msgf("Model found from galleries: %+v", m)
-		}
-		dat, err := json.Marshal(models)
-		if err != nil {
-			return err
-		}
-		return c.Send(dat)
-	}
-}
-
-// NOTE: This is different (and much simpler!) than above! This JUST lists the model galleries that have been loaded, not their contents!
-func (mgs *ModelGalleryEndpointService) ListModelGalleriesEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		log.Debug().Msgf("Listing model galleries %+v", mgs.galleries)
-		dat, err := json.Marshal(mgs.galleries)
-		if err != nil {
-			return err
-		}
-		return c.Send(dat)
-	}
-}
-
-func (mgs *ModelGalleryEndpointService) AddModelGalleryEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		input := new(gallery.Gallery)
-		// Get input data from the request body
-		if err := c.BodyParser(input); err != nil {
-			return err
-		}
-		if slices.ContainsFunc(mgs.galleries, func(gallery gallery.Gallery) bool {
-			return gallery.Name == input.Name
-		}) {
-			return fmt.Errorf("%s already exists", input.Name)
-		}
-		dat, err := json.Marshal(mgs.galleries)
-		if err != nil {
-			return err
-		}
-		log.Debug().Msgf("Adding %+v to gallery list", *input)
-		mgs.galleries = append(mgs.galleries, *input)
-		return c.Send(dat)
-	}
-}
-
-func (mgs *ModelGalleryEndpointService) RemoveModelGalleryEndpoint() func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		input := new(gallery.Gallery)
-		// Get input data from the request body
-		if err := c.BodyParser(input); err != nil {
-			return err
-		}
-		if !slices.ContainsFunc(mgs.galleries, func(gallery gallery.Gallery) bool {
-			return gallery.Name == input.Name
-		}) {
-			return fmt.Errorf("%s is not currently registered", input.Name)
-		}
-		mgs.galleries = slices.DeleteFunc(mgs.galleries, func(gallery gallery.Gallery) bool {
-			return gallery.Name == input.Name
+		mgs.galleryApplier.EnqueueModelOp(galleryop.ManagementOp[gallery.GalleryModel, gallery.ModelConfig]{
+			Req:                input.GalleryModel,
+			ID:                 uuid.String(),
+			GalleryElementName: input.ID,
+			Variant:            input.Variant,
+			Galleries:          mgs.galleries,
+			BackendGalleries:   mgs.backendGalleries,
 		})
-		return c.Send(nil)
+
+		return c.JSON(200, schema.GalleryResponse{ID: uuid.String(), StatusURL: fmt.Sprintf("%smodels/jobs/%s", middleware.BaseURL(c), uuid.String())})
+	}
+}
+
+// DeleteModelGalleryEndpoint lets delete models from a LocalAI instance
+// @Summary delete models to LocalAI.
+// @Tags models
+// @Param name	path string	true	"Model name"
+// @Success 200 {object} schema.GalleryResponse "Response"
+// @Router /models/delete/{name} [post]
+func (mgs *ModelGalleryEndpointService) DeleteModelGalleryEndpoint() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		modelName := c.Param("name")
+
+		uuid, err := uuid.NewUUID()
+		if err != nil {
+			return err
+		}
+
+		// The op carries the same ID the caller is handed back: without it the
+		// deletion ran under an empty ID and StatusURL pointed at a job that
+		// could never have a status.
+		mgs.galleryApplier.EnqueueModelOp(galleryop.ManagementOp[gallery.GalleryModel, gallery.ModelConfig]{
+			ID:                 uuid.String(),
+			Delete:             true,
+			GalleryElementName: modelName,
+		})
+
+		mgs.configLoader.RemoveModelConfig(modelName)
+
+		return c.JSON(200, schema.GalleryResponse{ID: uuid.String(), StatusURL: fmt.Sprintf("%smodels/jobs/%s", middleware.BaseURL(c), uuid.String())})
+	}
+}
+
+// ListModelFromGalleryEndpoint list the available models for installation from the active galleries
+// @Summary List installable models.
+// @Tags models
+// @Success 200 {object} []gallery.Metadata "Response"
+// @Router /models/available [get]
+func (mgs *ModelGalleryEndpointService) ListModelFromGalleryEndpoint(systemState *system.SystemState) echo.HandlerFunc {
+	return func(c echo.Context) error {
+
+		models, err := gallery.AvailableGalleryModels(mgs.galleries, systemState)
+		if err != nil {
+			xlog.Error("could not list models from galleries", "error", err)
+			return err
+		}
+
+		xlog.Debug("Available models from galleries", "modelCount", len(models), "galleryCount", len(mgs.galleries))
+
+		m := []gallery.Metadata{}
+
+		for _, mm := range models {
+			m = append(m, mm.Metadata)
+		}
+
+		xlog.Debug("Models", "models", m)
+
+		dat, err := json.Marshal(m)
+		if err != nil {
+			return fmt.Errorf("could not marshal models: %w", err)
+		}
+		return c.Blob(200, "application/json", dat)
+	}
+}
+
+// ListModelGalleriesEndpoint list the available galleries configured in LocalAI
+// @Summary List all Galleries
+// @Tags models
+// @Success 200 {object} []config.Gallery "Response"
+// @Router /models/galleries [get]
+// NOTE: This is different (and much simpler!) than above! This JUST lists the model galleries that have been loaded, not their contents!
+func (mgs *ModelGalleryEndpointService) ListModelGalleriesEndpoint() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		xlog.Debug("Listing model galleries", "galleries", mgs.galleries)
+		dat, err := json.Marshal(mgs.galleries)
+		if err != nil {
+			return err
+		}
+		return c.Blob(200, "application/json", dat)
 	}
 }

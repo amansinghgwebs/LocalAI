@@ -6,27 +6,36 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-skynet/LocalAI/core/config"
-	"github.com/go-skynet/LocalAI/core/schema"
 	"github.com/google/uuid"
+	"github.com/labstack/echo/v4"
 
-	"github.com/go-skynet/LocalAI/core/backend"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/middleware"
+	"github.com/mudler/LocalAI/core/schema"
 
-	model "github.com/go-skynet/LocalAI/pkg/model"
-	"github.com/gofiber/fiber/v2"
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/LocalAI/core/backend"
+
+	"github.com/mudler/xlog"
+
+	"github.com/mudler/LocalAI/pkg/httpclient"
+	model "github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/utils"
 )
 
 func downloadFile(url string) (string, error) {
+	if err := utils.ValidateExternalURL(url); err != nil {
+		return "", fmt.Errorf("URL validation failed: %w", err)
+	}
+
 	// Get the data
-	resp, err := http.Get(url)
+	resp, err := httpclient.New(httpclient.WithFollowRedirects()).Get(url)
 	if err != nil {
 		return "", err
 	}
@@ -61,79 +70,69 @@ func downloadFile(url string) (string, error) {
 */
 // ImageEndpoint is the OpenAI Image generation API endpoint https://platform.openai.com/docs/api-reference/images/create
 // @Summary Creates an image given a prompt.
+// @Tags images
 // @Param request body schema.OpenAIRequest true "query params"
 // @Success 200 {object} schema.OpenAIResponse "Response"
 // @Router /v1/images/generations [post]
-func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		m, input, err := readRequest(c, ml, appConfig, false)
-		if err != nil {
-			return fmt.Errorf("failed reading parameters from request:%w", err)
+func ImageEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
+		if !ok || input.Model == "" {
+			xlog.Error("Image Endpoint - Invalid Input")
+			return echo.ErrBadRequest
 		}
 
-		if m == "" {
-			m = model.StableDiffusionBackend
-		}
-		log.Debug().Msgf("Loading model: %+v", m)
-
-		config, input, err := mergeRequestWithConfig(m, input, cl, ml, appConfig.Debug, 0, 0, false)
-		if err != nil {
-			return fmt.Errorf("failed reading parameters from request:%w", err)
+		config, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
+		if !ok || config == nil {
+			xlog.Error("Image Endpoint - Invalid Config")
+			return echo.ErrBadRequest
 		}
 
+		// Process input images (for img2img/inpainting)
 		src := ""
 		if input.File != "" {
-
-			fileData := []byte{}
-			// check if input.File is an URL, if so download it and save it
-			// to a temporary file
-			if strings.HasPrefix(input.File, "http://") || strings.HasPrefix(input.File, "https://") {
-				out, err := downloadFile(input.File)
-				if err != nil {
-					return fmt.Errorf("failed downloading file:%w", err)
-				}
-				defer os.RemoveAll(out)
-
-				fileData, err = os.ReadFile(out)
-				if err != nil {
-					return fmt.Errorf("failed reading file:%w", err)
-				}
-
-			} else {
-				// base 64 decode the file and write it somewhere
-				// that we will cleanup
-				fileData, err = base64.StdEncoding.DecodeString(input.File)
-				if err != nil {
-					return err
-				}
+			src = processImageFile(input.File, appConfig.GeneratedContentDir)
+			if src != "" {
+				defer os.RemoveAll(src)
 			}
-
-			// Create a temporary file
-			outputFile, err := os.CreateTemp(appConfig.ImageDir, "b64")
-			if err != nil {
-				return err
-			}
-			// write the base64 result
-			writer := bufio.NewWriter(outputFile)
-			_, err = writer.Write(fileData)
-			if err != nil {
-				outputFile.Close()
-				return err
-			}
-			outputFile.Close()
-			src = outputFile.Name()
-			defer os.RemoveAll(src)
 		}
 
-		log.Debug().Msgf("Parameter Config: %+v", config)
+		// Process multiple input images
+		var inputImages []string
+		if len(input.Files) > 0 {
+			for _, file := range input.Files {
+				processedFile := processImageFile(file, appConfig.GeneratedContentDir)
+				if processedFile != "" {
+					inputImages = append(inputImages, processedFile)
+					defer os.RemoveAll(processedFile)
+				}
+			}
+		}
+
+		// Process reference images
+		var refImages []string
+		if len(input.RefImages) > 0 {
+			for _, file := range input.RefImages {
+				processedFile := processImageFile(file, appConfig.GeneratedContentDir)
+				if processedFile != "" {
+					refImages = append(refImages, processedFile)
+					defer os.RemoveAll(processedFile)
+				}
+			}
+		}
+
+		xlog.Debug("Parameter Config", "config", config)
 
 		switch config.Backend {
 		case "stablediffusion":
-			config.Backend = model.StableDiffusionBackend
-		case "tinydream":
-			config.Backend = model.TinyDreamBackend
+			config.Backend = model.StableDiffusionGGMLBackend
 		case "":
-			config.Backend = model.StableDiffusionBackend
+			config.Backend = model.StableDiffusionGGMLBackend
+		}
+
+		if !strings.Contains(input.Size, "x") {
+			input.Size = "512x512"
+			xlog.Warn("Invalid size, using default 512x512")
 		}
 
 		sizeParts := strings.Split(input.Size, "x")
@@ -149,10 +148,8 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 			return fmt.Errorf("invalid value for 'size'")
 		}
 
-		b64JSON := false
-		if input.ResponseFormat.Type == "b64_json" {
-			b64JSON = true
-		}
+		b64JSON := config.ResponseFormat == "b64_json"
+
 		// src and clip_skip
 		var result []schema.Item
 		for _, i := range config.PromptStrings {
@@ -160,7 +157,7 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 			if input.N == 0 {
 				n = 1
 			}
-			for j := 0; j < n; j++ {
+			for range n {
 				prompts := strings.Split(i, "|")
 				positive_prompt := prompts[0]
 				negative_prompt := ""
@@ -168,14 +165,9 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 					negative_prompt = prompts[1]
 				}
 
-				mode := 0
 				step := config.Step
 				if step == 0 {
 					step = 15
-				}
-
-				if input.Mode != 0 {
-					mode = input.Mode
 				}
 
 				if input.Step != 0 {
@@ -184,7 +176,7 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 
 				tempDir := ""
 				if !b64JSON {
-					tempDir = appConfig.ImageDir
+					tempDir = filepath.Join(appConfig.GeneratedContentDir, "images")
 				}
 				// Create a temporary file
 				outputFile, err := os.CreateTemp(tempDir, "b64")
@@ -192,6 +184,7 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 					return err
 				}
 				outputFile.Close()
+
 				output := outputFile.Name() + ".png"
 				// Rename the temporary file
 				err = os.Rename(outputFile.Name(), output)
@@ -199,9 +192,15 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 					return err
 				}
 
-				baseURL := c.BaseURL()
+				baseURL := middleware.BaseURL(c)
 
-				fn, err := backend.ImageGeneration(height, width, mode, step, *config.Seed, positive_prompt, negative_prompt, src, output, ml, *config, appConfig)
+				// Use the first input image as src if available, otherwise use the original src
+				inputSrc := src
+				if len(inputImages) > 0 {
+					inputSrc = inputImages[0]
+				}
+
+				fn, err := backend.ImageGeneration(c.Request().Context(), height, width, step, *config.Seed, positive_prompt, negative_prompt, inputSrc, output, ml, *config, appConfig, refImages)
 				if err != nil {
 					return err
 				}
@@ -220,7 +219,10 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 					item.B64JSON = base64.StdEncoding.EncodeToString(data)
 				} else {
 					base := filepath.Base(output)
-					item.URL = baseURL + "/generated-images/" + base
+					item.URL, err = url.JoinPath(baseURL, "generated-images", base)
+					if err != nil {
+						return err
+					}
 				}
 
 				result = append(result, *item)
@@ -233,12 +235,76 @@ func ImageEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appCon
 			ID:      id,
 			Created: created,
 			Data:    result,
+			Usage: &schema.OpenAIUsage{
+				PromptTokens:     0,
+				CompletionTokens: 0,
+				TotalTokens:      0,
+				InputTokens:      0,
+				OutputTokens:     0,
+				InputTokensDetails: &schema.InputTokensDetails{
+					TextTokens:  0,
+					ImageTokens: 0,
+				},
+			},
 		}
 
 		jsonResult, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", jsonResult)
+		xlog.Debug("Response", "response", string(jsonResult))
 
 		// Return the prediction in the response body
-		return c.JSON(resp)
+		return c.JSON(200, resp)
 	}
+}
+
+// processImageFile handles a single image file (URL or base64) and returns the path to the temporary file
+func processImageFile(file string, generatedContentDir string) string {
+	fileData := []byte{}
+	var err error
+
+	// check if file is an URL, if so download it and save it to a temporary file
+	if strings.HasPrefix(file, "http://") || strings.HasPrefix(file, "https://") {
+		out, err := downloadFile(file)
+		if err != nil {
+			xlog.Error("Failed downloading file", "error", err, "file", file)
+			return ""
+		}
+		defer os.RemoveAll(out)
+
+		fileData, err = os.ReadFile(out)
+		if err != nil {
+			xlog.Error("Failed reading downloaded file", "error", err, "file", out)
+			return ""
+		}
+	} else {
+		// base 64 decode the file and write it somewhere that we will cleanup
+		fileData, err = base64.StdEncoding.DecodeString(file)
+		if err != nil {
+			xlog.Error("Failed decoding base64 file", "error", err)
+			return ""
+		}
+	}
+
+	// Create a temporary file
+	outputFile, err := os.CreateTemp(generatedContentDir, "b64")
+	if err != nil {
+		xlog.Error("Failed creating temporary file", "error", err)
+		return ""
+	}
+
+	// write the decoded result
+	writer := bufio.NewWriter(outputFile)
+	_, err = writer.Write(fileData)
+	if err != nil {
+		outputFile.Close()
+		xlog.Error("Failed writing to temporary file", "error", err)
+		return ""
+	}
+	if err := writer.Flush(); err != nil {
+		outputFile.Close()
+		xlog.Error("Failed flushing to temporary file", "error", err)
+		return ""
+	}
+	outputFile.Close()
+
+	return outputFile.Name()
 }

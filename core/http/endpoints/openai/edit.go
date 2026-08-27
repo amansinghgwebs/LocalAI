@@ -2,62 +2,64 @@ package openai
 
 import (
 	"encoding/json"
-	"fmt"
 	"time"
 
-	"github.com/go-skynet/LocalAI/core/backend"
-	"github.com/go-skynet/LocalAI/core/config"
+	"github.com/labstack/echo/v4"
+	"github.com/mudler/LocalAI/core/backend"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/http/middleware"
 
-	"github.com/go-skynet/LocalAI/core/schema"
-	model "github.com/go-skynet/LocalAI/pkg/model"
-	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/mudler/LocalAI/core/schema"
 
-	"github.com/rs/zerolog/log"
+	"github.com/mudler/LocalAI/core/templates"
+	"github.com/mudler/LocalAI/pkg/model"
+
+	"github.com/mudler/xlog"
 )
 
-func EditEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
-		modelFile, input, err := readRequest(c, ml, appConfig, true)
-		if err != nil {
-			return fmt.Errorf("failed reading parameters from request:%w", err)
+// EditEndpoint is the OpenAI edit API endpoint
+// @Summary OpenAI edit endpoint
+// @Tags inference
+// @Param request body schema.OpenAIRequest true "query params"
+// @Success 200 {object} schema.OpenAIResponse "Response"
+// @Router /v1/edits [post]
+func EditEndpoint(cl *config.ModelConfigLoader, ml *model.ModelLoader, evaluator *templates.Evaluator, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+
+	return func(c echo.Context) error {
+
+		input, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_LOCALAI_REQUEST).(*schema.OpenAIRequest)
+		if !ok || input.Model == "" {
+			return echo.ErrBadRequest
+		}
+		// Opt-in extra usage flag
+		extraUsage := c.Request().Header.Get("Extra-Usage") != ""
+
+		config, ok := c.Get(middleware.CONTEXT_LOCALS_KEY_MODEL_CONFIG).(*config.ModelConfig)
+		if !ok || config == nil {
+			return echo.ErrBadRequest
 		}
 
-		config, input, err := mergeRequestWithConfig(modelFile, input, cl, ml, appConfig.Debug, appConfig.Threads, appConfig.ContextSize, appConfig.F16)
-		if err != nil {
-			return fmt.Errorf("failed reading parameters from request:%w", err)
-		}
-
-		log.Debug().Msgf("Parameter Config: %+v", config)
-
-		templateFile := ""
-
-		// A model can have a "file.bin.tmpl" file associated with a prompt template prefix
-		if ml.ExistsInModelPath(fmt.Sprintf("%s.tmpl", config.Model)) {
-			templateFile = config.Model
-		}
-
-		if config.TemplateConfig.Edit != "" {
-			templateFile = config.TemplateConfig.Edit
-		}
+		xlog.Debug("Edit Endpoint Input", "input", input)
+		xlog.Debug("Edit Endpoint Config", "config", *config)
 
 		var result []schema.Choice
 		totalTokenUsage := backend.TokenUsage{}
 
 		for _, i := range config.InputStrings {
-			if templateFile != "" {
-				templatedInput, err := ml.EvaluateTemplateForPrompt(model.EditPromptTemplate, templateFile, model.PromptTemplateData{
-					Input:        i,
-					Instruction:  input.Instruction,
-					SystemPrompt: config.SystemPrompt,
-				})
-				if err == nil {
-					i = templatedInput
-					log.Debug().Msgf("Template found, input modified to: %s", i)
-				}
+			templatedInput, err := evaluator.EvaluateTemplateForPrompt(templates.EditPromptTemplate, *config, templates.PromptTemplateData{
+				Input:           i,
+				Instruction:     input.Instruction,
+				SystemPrompt:    config.SystemPrompt,
+				ReasoningEffort: input.ReasoningEffort,
+				Metadata:        input.Metadata,
+			})
+			if err == nil {
+				i = templatedInput
+				xlog.Debug("Template found, input modified", "input", i)
 			}
 
-			r, tokenUsage, err := ComputeChoices(input, i, config, appConfig, ml, func(s string, c *[]schema.Choice) {
+			r, tokenUsage, _, err := ComputeChoices(input, i, config, cl, appConfig, ml, func(s string, c *[]schema.Choice) {
 				*c = append(*c, schema.Choice{Text: s})
 			}, nil)
 			if err != nil {
@@ -67,7 +69,19 @@ func EditEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConf
 			totalTokenUsage.Prompt += tokenUsage.Prompt
 			totalTokenUsage.Completion += tokenUsage.Completion
 
+			totalTokenUsage.TimingTokenGeneration += tokenUsage.TimingTokenGeneration
+			totalTokenUsage.TimingPromptProcessing += tokenUsage.TimingPromptProcessing
+
 			result = append(result, r...)
+		}
+		usage := schema.OpenAIUsage{
+			PromptTokens:     totalTokenUsage.Prompt,
+			CompletionTokens: totalTokenUsage.Completion,
+			TotalTokens:      totalTokenUsage.Prompt + totalTokenUsage.Completion,
+		}
+		if extraUsage {
+			usage.TimingTokenGeneration = totalTokenUsage.TimingTokenGeneration
+			usage.TimingPromptProcessing = totalTokenUsage.TimingPromptProcessing
 		}
 
 		id := uuid.New().String()
@@ -78,17 +92,15 @@ func EditEndpoint(cl *config.BackendConfigLoader, ml *model.ModelLoader, appConf
 			Model:   input.Model, // we have to return what the user sent here, due to OpenAI spec.
 			Choices: result,
 			Object:  "edit",
-			Usage: schema.OpenAIUsage{
-				PromptTokens:     totalTokenUsage.Prompt,
-				CompletionTokens: totalTokenUsage.Completion,
-				TotalTokens:      totalTokenUsage.Prompt + totalTokenUsage.Completion,
-			},
+			Usage:   &usage,
 		}
 
 		jsonResult, _ := json.Marshal(resp)
-		log.Debug().Msgf("Response: %s", jsonResult)
+		xlog.Debug("Response", "response", string(jsonResult))
+
+		middleware.StampUsage(c, input.Model, totalTokenUsage.Prompt, totalTokenUsage.Completion)
 
 		// Return the prediction in the response body
-		return c.JSON(resp)
+		return c.JSON(200, resp)
 	}
 }

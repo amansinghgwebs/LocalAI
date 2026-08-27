@@ -4,24 +4,32 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"net/http"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/mudler/xlog"
+
+	"github.com/mudler/LocalAI/pkg/httpclient"
 )
 
-var base64DownloadClient http.Client = http.Client{
-	Timeout: 30 * time.Second,
-}
+var base64DownloadClient = httpclient.NewWithTimeout(30*time.Second, httpclient.WithFollowRedirects())
 
-// this function check if the string is an URL, if it's an URL downloads the image in memory
-// encodes it in base64 and returns the base64 string
+// Match `data:<mime>[;param=value...];base64,` — browser-produced data URIs
+// often carry codec/charset params between the mime type and `;base64,`
+// (e.g. MediaRecorder's `data:audio/webm;codecs=opus;base64,...`). The old
+// `([^;]+)` form only tolerated exactly one segment, so anything with
+// extra params failed the strip and tripped the downstream base64 decoder
+// on the `data:` literal.
+var dataURIPattern = regexp.MustCompile(`^data:[^,]+?;base64,`)
 
-// This may look weird down in pkg/utils while it is currently only used in core/config
-//
-//	but I believe it may be useful for MQTT as well in the near future, so I'm
-//	extracting it while I'm thinking of it.
-func GetImageURLAsBase64(s string) (string, error) {
-	if strings.HasPrefix(s, "http") {
+// GetContentURIAsBase64 checks if the string is an URL, if it's an URL downloads the content in memory encodes it in base64 and returns the base64 string, otherwise returns the string by stripping base64 data headers
+func GetContentURIAsBase64(s string) (string, error) {
+	if strings.HasPrefix(s, "http") || strings.HasPrefix(s, "https") {
+		if err := ValidateExternalURL(s); err != nil {
+			return "", fmt.Errorf("URL validation failed: %w", err)
+		}
+
 		// download the image
 		resp, err := base64DownloadClient.Get(s)
 		if err != nil {
@@ -42,9 +50,11 @@ func GetImageURLAsBase64(s string) (string, error) {
 		return encoded, nil
 	}
 
-	// if the string instead is prefixed with "data:image/jpeg;base64,", drop it
-	if strings.HasPrefix(s, "data:image/jpeg;base64,") {
-		return strings.ReplaceAll(s, "data:image/jpeg;base64,", ""), nil
+	// Match any data URI prefix pattern
+	if match := dataURIPattern.FindString(s); match != "" {
+		xlog.Debug("Found data URI prefix", "prefix", match)
+		return strings.Replace(s, match, "", 1), nil
 	}
-	return "", fmt.Errorf("not valid string")
+
+	return "", fmt.Errorf("not valid base64 data type string")
 }

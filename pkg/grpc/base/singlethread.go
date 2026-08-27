@@ -3,7 +3,7 @@ package base
 import (
 	"sync"
 
-	pb "github.com/go-skynet/LocalAI/pkg/grpc/proto"
+	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 )
 
 // SingleThread are backends that does not support multiple requests.
@@ -49,4 +49,10 @@ func (llm *SingleThread) Status() (pb.StatusResponse, error) {
 		State:  state,
 		Memory: mud,
 	}, nil
+}
+
+// Free releases resources for SingleThread backends
+// The base implementation does nothing, derived classes should override if needed
+func (llm *SingleThread) Free() error {
+	return llm.Base.Free()
 }

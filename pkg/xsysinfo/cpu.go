@@ -1,6 +1,8 @@
 package xsysinfo
 
 import (
+	"maps"
+	"slices"
 	"sort"
 
 	"github.com/jaypipes/ghw"
@@ -23,10 +25,7 @@ func CPUCapabilities() ([]string, error) {
 
 	}
 
-	ret := []string{}
-	for c := range caps {
-		ret = append(ret, c)
-	}
+	ret := slices.Collect(maps.Keys(caps))
 
 	// order
 	sort.Strings(ret)
@@ -35,4 +34,11 @@ func CPUCapabilities() ([]string, error) {
 
 func HasCPUCaps(ids ...cpuid.FeatureID) bool {
 	return cpuid.CPU.Supports(ids...)
+}
+
+func CPUPhysicalCores() int {
+	if cpuid.CPU.PhysicalCores == 0 {
+		return 1
+	}
+	return cpuid.CPU.PhysicalCores
 }

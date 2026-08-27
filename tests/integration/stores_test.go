@@ -2,25 +2,34 @@ package integration_test
 
 import (
 	"context"
-	"embed"
 	"math"
+	"math/rand/v2"
 	"os"
-	"path/filepath"
 
+	"github.com/mudler/xlog"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 
-	"github.com/go-skynet/LocalAI/core/config"
-	"github.com/go-skynet/LocalAI/pkg/assets"
-	"github.com/go-skynet/LocalAI/pkg/grpc"
-	"github.com/go-skynet/LocalAI/pkg/model"
-	"github.com/go-skynet/LocalAI/pkg/store"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/gallery"
+	"github.com/mudler/LocalAI/pkg/grpc"
+	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/store"
+	"github.com/mudler/LocalAI/pkg/system"
 )
 
-//go:embed backend-assets/*
-var backendAssets embed.FS
+func normalize(vecs [][]float32) {
+	for i, k := range vecs {
+		norm := float64(0)
+		for _, x := range k {
+			norm += float64(x * x)
+		}
+		norm = math.Sqrt(norm)
+		for j, x := range k {
+			vecs[i][j] = x / float32(norm)
+		}
+	}
+}
 
 var _ = Describe("Integration tests for the stores backend(s) and internal APIs", Label("stores"), func() {
 	Context("Embedded Store get,set and delete", func() {
@@ -31,20 +40,12 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 		BeforeEach(func() {
 			var err error
 
-			zerolog.SetGlobalLevel(zerolog.DebugLevel)
-
 			tmpdir, err = os.MkdirTemp("", "")
-			Expect(err).ToNot(HaveOccurred())
-			backendAssetsDir := filepath.Join(tmpdir, "backend-assets")
-			err = os.Mkdir(backendAssetsDir, 0750)
-			Expect(err).ToNot(HaveOccurred())
-
-			err = assets.ExtractFiles(backendAssets, backendAssetsDir)
 			Expect(err).ToNot(HaveOccurred())
 
 			debug := true
 
-			bc := config.BackendConfig{
+			bc := config.ModelConfig{
 				Name:    "store test",
 				Debug:   &debug,
 				Backend: model.LocalStoreBackend,
@@ -52,12 +53,21 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			storeOpts := []model.Option{
 				model.WithBackendString(bc.Backend),
-				model.WithAssetDir(backendAssetsDir),
-				model.WithModel("test"),
+				model.WithModel(store.NamespacePrefix + "test"),
 			}
 
-			sl = model.NewModelLoader("")
-			sc, err = sl.BackendLoader(storeOpts...)
+			// External backends are normally registered at app startup
+			// (gallery.RegisterBackends); a bare ModelLoader knows none,
+			// so wire up the BACKENDS_PATH the Makefile builds into.
+			systemState, err := system.GetSystemState(
+				system.WithModelPath(tmpdir),
+				system.WithBackendPath(os.Getenv("BACKENDS_PATH")),
+			)
+			Expect(err).ToNot(HaveOccurred())
+
+			sl = model.NewModelLoader(systemState)
+			Expect(gallery.RegisterBackends(systemState, sl)).To(Succeed())
+			sc, err = sl.Load(storeOpts...)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(sc).ToNot(BeNil())
 		})
@@ -166,6 +176,23 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 			Expect(vals).To(HaveLen(0))
 		})
 
+		It("should accept a new embedding dimension after deleting every key", func() {
+			ctx := context.Background()
+			oldKey := []float32{0.1, 0.2, 0.3}
+			newKey := []float32{0.6, 0.8}
+
+			Expect(store.SetSingle(ctx, sc, oldKey, []byte("old"))).To(Succeed())
+			Expect(store.DeleteSingle(ctx, sc, oldKey)).To(Succeed())
+			Expect(store.SetSingle(ctx, sc, newKey, []byte("new"))).To(Succeed())
+
+			keys, vals, sims, err := store.Find(ctx, sc, newKey, 1)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(keys).To(Equal([][]float32{newKey}))
+			Expect(vals).To(Equal([][]byte{[]byte("new")}))
+			Expect(sims).To(HaveLen(1))
+			Expect(sims[0]).To(BeNumerically("~", 1, 0.0001))
+		})
+
 		It("should be able to find smilar keys", func() {
 			// set 3 vectors that are at varying angles to {0.5, 0.5, 0.5}
 			err := store.SetCols(context.Background(), sc, [][]float32{{0.5, 0.5, 0.5}, {0.6, 0.6, -0.6}, {0.7, -0.7, -0.7}}, [][]byte{[]byte("test1"), []byte("test2"), []byte("test3")})
@@ -180,7 +207,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range keys {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(keys[0]).To(Equal([]float32{0.5, 0.5, 0.5}))
@@ -192,17 +219,8 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 			// set 3 vectors that are at varying angles to {0.5, 0.5, 0.5}
 			keys := [][]float32{{0.1, 0.3, 0.5}, {0.5, 0.5, 0.5}, {0.6, 0.6, -0.6}, {0.7, -0.7, -0.7}}
 			vals := [][]byte{[]byte("test0"), []byte("test1"), []byte("test2"), []byte("test3")}
-			// normalize the keys
-			for i, k := range keys {
-				norm := float64(0)
-				for _, x := range k {
-					norm += float64(x * x)
-				}
-				norm = math.Sqrt(norm)
-				for j, x := range k {
-					keys[i][j] = x / float32(norm)
-				}
-			}
+
+			normalize(keys)
 
 			err := store.SetCols(context.Background(), sc, keys, vals)
 			Expect(err).ToNot(HaveOccurred())
@@ -216,7 +234,7 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 
 			for i, k := range ks {
 				s := sims[i]
-				log.Debug().Float32("similarity", s).Msgf("key: %v", k)
+				xlog.Debug("key", "similarity", s, "key", k)
 			}
 
 			Expect(ks[0]).To(Equal(keys[0]))
@@ -224,6 +242,122 @@ var _ = Describe("Integration tests for the stores backend(s) and internal APIs"
 			Expect(sims[0]).To(BeNumerically("~", 1, 0.0001))
 			Expect(ks[1]).To(Equal(keys[1]))
 			Expect(vals[1]).To(Equal(vals[1]))
+		})
+
+		It("It produces the correct cosine similarities for orthogonal and opposite unit vectors", func() {
+			keys := [][]float32{{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0}, {-1.0, 0.0, 0.0}}
+			vals := [][]byte{[]byte("x"), []byte("y"), []byte("z"), []byte("-z")}
+
+			err := store.SetCols(context.Background(), sc, keys, vals)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, _, sims, err := store.Find(context.Background(), sc, keys[0], 4)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sims).To(Equal([]float32{1.0, 0.0, 0.0, -1.0}))
+		})
+
+		It("It produces the correct cosine similarities for orthogonal and opposite vectors", func() {
+			keys := [][]float32{{1.0, 0.0, 1.0}, {0.0, 2.0, 0.0}, {0.0, 0.0, -1.0}, {-1.0, 0.0, -1.0}}
+			vals := [][]byte{[]byte("x"), []byte("y"), []byte("z"), []byte("-z")}
+
+			err := store.SetCols(context.Background(), sc, keys, vals)
+			Expect(err).ToNot(HaveOccurred())
+
+			_, _, sims, err := store.Find(context.Background(), sc, keys[0], 4)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(sims[0]).To(BeNumerically("~", 1, 0.1))
+			Expect(sims[1]).To(BeNumerically("~", 0, 0.1))
+			Expect(sims[2]).To(BeNumerically("~", -0.7, 0.1))
+			Expect(sims[3]).To(BeNumerically("~", -1, 0.1))
+		})
+
+		expectTriangleEq := func(keys [][]float32, vals [][]byte) {
+			sims := map[string]map[string]float32{}
+
+			// compare every key vector pair and store the similarities in a lookup table
+			// that uses the values as keys
+			for i, k := range keys {
+				_, valsk, simsk, err := store.Find(context.Background(), sc, k, 9)
+				Expect(err).ToNot(HaveOccurred())
+
+				for j, v := range valsk {
+					p := string(vals[i])
+					q := string(v)
+
+					if sims[p] == nil {
+						sims[p] = map[string]float32{}
+					}
+
+					//log.Debug().Strs("vals", []string{p, q}).Float32("similarity", simsk[j]).Send()
+
+					sims[p][q] = simsk[j]
+				}
+			}
+
+			// Check that the triangle inequality holds for every combination of the triplet
+			// u, v and w
+			for _, simsu := range sims {
+				for w, simw := range simsu {
+					// acos(u,w) <= ...
+					uws := math.Acos(float64(simw))
+
+					// ... acos(u,v) + acos(v,w)
+					for v, _ := range simsu {
+						uvws := math.Acos(float64(simsu[v])) + math.Acos(float64(sims[v][w]))
+
+						//log.Debug().Str("u", u).Str("v", v).Str("w", w).Send()
+						//log.Debug().Float32("uw", simw).Float32("uv", simsu[v]).Float32("vw", sims[v][w]).Send()
+						Expect(uws).To(BeNumerically("<=", uvws))
+					}
+				}
+			}
+		}
+
+		It("It obeys the triangle inequality for normalized values", func() {
+			keys := [][]float32{
+				{1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}, {0.0, 0.0, 1.0},
+				{-1.0, 0.0, 0.0}, {0.0, -1.0, 0.0}, {0.0, 0.0, -1.0},
+				{2.0, 3.0, 4.0}, {9.0, 7.0, 1.0}, {0.0, -1.2, 2.3},
+			}
+			vals := [][]byte{
+				[]byte("x"), []byte("y"), []byte("z"),
+				[]byte("-x"), []byte("-y"), []byte("-z"),
+				[]byte("u"), []byte("v"), []byte("w"),
+			}
+
+			normalize(keys[6:])
+
+			err := store.SetCols(context.Background(), sc, keys, vals)
+			Expect(err).ToNot(HaveOccurred())
+
+			expectTriangleEq(keys, vals)
+		})
+
+		It("It obeys the triangle inequality", func() {
+			rnd := rand.New(rand.NewPCG(151, 0))
+			keys := make([][]float32, 20)
+			vals := make([][]byte, 20)
+
+			for i := range keys {
+				k := make([]float32, 768)
+
+				for j := range k {
+					k[j] = rnd.Float32()
+				}
+
+				keys[i] = k
+			}
+
+			c := byte('a')
+			for i := range vals {
+				vals[i] = []byte{c}
+				c += 1
+			}
+
+			err := store.SetCols(context.Background(), sc, keys, vals)
+			Expect(err).ToNot(HaveOccurred())
+
+			expectTriangleEq(keys, vals)
 		})
 	})
 })

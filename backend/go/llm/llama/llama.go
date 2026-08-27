@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/go-skynet/LocalAI/pkg/grpc/base"
-	pb "github.com/go-skynet/LocalAI/pkg/grpc/proto"
 	"github.com/go-skynet/go-llama.cpp"
+	"github.com/mudler/LocalAI/pkg/grpc/base"
+	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 )
 
 type LLM struct {
@@ -18,6 +18,19 @@ type LLM struct {
 	draftModel *llama.LLama
 }
 
+// Free releases GPU resources and frees the llama model
+// This should be called when the model is being unloaded to properly release VRAM
+func (llm *LLM) Free() error {
+	if llm.llama != nil {
+		llm.llama.Free()
+		llm.llama = nil
+	}
+	if llm.draftModel != nil {
+		llm.draftModel.Free()
+		llm.draftModel = nil
+	}
+	return nil
+}
 func (llm *LLM) Load(opts *pb.ModelOptions) error {
 	ropeFreqBase := float32(10000)
 	ropeFreqScale := float32(1)
@@ -57,6 +70,9 @@ func (llm *LLM) Load(opts *pb.ModelOptions) error {
 	}
 	if opts.Embeddings {
 		llamaOpts = append(llamaOpts, llama.EnableEmbeddings)
+	}
+	if opts.Reranking {
+		llamaOpts = append(llamaOpts, llama.EnableReranking)
 	}
 	if opts.NGPULayers != 0 {
 		llamaOpts = append(llamaOpts, llama.SetGPULayers(int(opts.NGPULayers)))

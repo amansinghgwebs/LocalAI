@@ -1,50 +1,30 @@
 #!/bin/bash
-set -ex
+set -e
 
-SKIP_CONDA=${SKIP_CONDA:-0}
-
-# Check if environment exist
-conda_env_exists(){
-    ! conda list --name "${@}" >/dev/null 2>/dev/null
-}
-
-if [ $SKIP_CONDA -eq 1 ]; then
-    echo "Skipping conda environment installation"
+backend_dir=$(dirname $0)
+if [ -d $backend_dir/common ]; then
+    source $backend_dir/common/libbackend.sh
 else
-    export PATH=$PATH:/opt/conda/bin
-    if conda_env_exists "diffusers" ; then
-        echo "Creating virtual environment..."
-        conda env create --name diffusers --file $1
-        echo "Virtual environment created."
-    else 
-        echo "Virtual environment already exists."
-    fi
+    source $backend_dir/../common/libbackend.sh
 fi
 
-if [ -d "/opt/intel" ]; then
-    # Intel GPU: If the directory exists, we assume we are using the Intel image
-    # https://github.com/intel/intel-extension-for-pytorch/issues/538
-    pip install torch==2.1.0a0 \
-                torchvision==0.16.0a0 \
-                torchaudio==2.1.0a0 \
-                intel-extension-for-pytorch==2.1.10+xpu \
-                --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
-    
-    pip install google-api-python-client \
-                grpcio==1.63.0 \
-                grpcio-tools==1.63.0 \
-                diffusers==0.24.0 \
-                transformers>=4.25.1 \
-                accelerate \
-                compel==2.0.2 \
-                Pillow
+# This is here because the Intel pip index is broken and returns 200 status codes for every package name, it just doesn't return any package links.
+# This makes uv think that the package exists in the Intel pip index, and by default it stops looking at other pip indexes once it finds a match.
+# We need uv to continue falling through to the pypi default index to find optimum[openvino] in the pypi index
+# the --upgrade actually allows us to *downgrade* torch to the version provided in the Intel pip index
+if [ "x${BUILD_PROFILE}" == "xintel" ]; then
+    EXTRA_PIP_INSTALL_FLAGS+=" --upgrade --index-strategy=unsafe-first-match"
 fi
 
-if [ "$PIP_CACHE_PURGE" = true ] ; then
-    if [ $SKIP_CONDA -ne 1 ]; then
-        # Activate conda environment
-        source activate diffusers
-    fi
-
-    pip cache purge
+if [ "x${BUILD_PROFILE}" == "xl4t12" ]; then
+    USE_PIP=true
 fi
+
+# Use python 3.12 for l4t
+if [ "x${BUILD_PROFILE}" == "xl4t13" ]; then
+  PYTHON_VERSION="3.12"
+  PYTHON_PATCH="12"
+  PY_STANDALONE_TAG="20251120"
+fi
+
+installRequirements

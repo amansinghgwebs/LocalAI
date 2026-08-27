@@ -1,23 +1,23 @@
 package localai
 
 import (
-	"github.com/go-skynet/LocalAI/core/backend"
-	"github.com/go-skynet/LocalAI/core/config"
-	"github.com/go-skynet/LocalAI/core/schema"
-	"github.com/go-skynet/LocalAI/pkg/model"
-	"github.com/go-skynet/LocalAI/pkg/store"
-	"github.com/gofiber/fiber/v2"
+	"github.com/labstack/echo/v4"
+	"github.com/mudler/LocalAI/core/backend"
+	"github.com/mudler/LocalAI/core/config"
+	"github.com/mudler/LocalAI/core/schema"
+	"github.com/mudler/LocalAI/pkg/model"
+	"github.com/mudler/LocalAI/pkg/store"
 )
 
-func StoresSetEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func StoresSetEndpoint(sl *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		input := new(schema.StoresSet)
 
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
-		sb, err := backend.StoreBackend(sl, appConfig, input.Store)
+		sb, err := backend.StoreBackend(sl, appConfig, cl, input.Store, input.Backend)
 		if err != nil {
 			return err
 		}
@@ -27,50 +27,50 @@ func StoresSetEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfi
 			vals[i] = []byte(v)
 		}
 
-		err = store.SetCols(c.Context(), sb, input.Keys, vals)
+		err = store.SetCols(c.Request().Context(), sb, input.Keys, vals)
 		if err != nil {
 			return err
 		}
 
-		return c.Send(nil)
+		return c.NoContent(200)
 	}
 }
 
-func StoresDeleteEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func StoresDeleteEndpoint(sl *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		input := new(schema.StoresDelete)
 
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
-		sb, err := backend.StoreBackend(sl, appConfig, input.Store)
+		sb, err := backend.StoreBackend(sl, appConfig, cl, input.Store, input.Backend)
 		if err != nil {
 			return err
 		}
 
-		if err := store.DeleteCols(c.Context(), sb, input.Keys); err != nil {
+		if err := store.DeleteCols(c.Request().Context(), sb, input.Keys); err != nil {
 			return err
 		}
 
-		return c.Send(nil)
+		return c.NoContent(200)
 	}
 }
 
-func StoresGetEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func StoresGetEndpoint(sl *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		input := new(schema.StoresGet)
 
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
-		sb, err := backend.StoreBackend(sl, appConfig, input.Store)
+		sb, err := backend.StoreBackend(sl, appConfig, cl, input.Store, input.Backend)
 		if err != nil {
 			return err
 		}
 
-		keys, vals, err := store.GetCols(c.Context(), sb, input.Keys)
+		keys, vals, err := store.GetCols(c.Request().Context(), sb, input.Keys)
 		if err != nil {
 			return err
 		}
@@ -84,24 +84,24 @@ func StoresGetEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfi
 			res.Values[i] = string(v)
 		}
 
-		return c.JSON(res)
+		return c.JSON(200, res)
 	}
 }
 
-func StoresFindEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConfig) func(c *fiber.Ctx) error {
-	return func(c *fiber.Ctx) error {
+func StoresFindEndpoint(sl *model.ModelLoader, cl *config.ModelConfigLoader, appConfig *config.ApplicationConfig) echo.HandlerFunc {
+	return func(c echo.Context) error {
 		input := new(schema.StoresFind)
 
-		if err := c.BodyParser(input); err != nil {
+		if err := c.Bind(input); err != nil {
 			return err
 		}
 
-		sb, err := backend.StoreBackend(sl, appConfig, input.Store)
+		sb, err := backend.StoreBackend(sl, appConfig, cl, input.Store, input.Backend)
 		if err != nil {
 			return err
 		}
 
-		keys, vals, similarities, err := store.Find(c.Context(), sb, input.Key, input.Topk)
+		keys, vals, similarities, err := store.Find(c.Request().Context(), sb, input.Key, input.Topk)
 		if err != nil {
 			return err
 		}
@@ -116,6 +116,6 @@ func StoresFindEndpoint(sl *model.ModelLoader, appConfig *config.ApplicationConf
 			res.Values[i] = string(v)
 		}
 
-		return c.JSON(res)
+		return c.JSON(200, res)
 	}
 }

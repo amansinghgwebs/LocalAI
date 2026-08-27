@@ -1,6 +1,9 @@
 package downloader
 
-import "hash"
+import (
+	"context"
+	"hash"
+)
 
 type progressWriter struct {
 	fileName       string
@@ -9,31 +12,60 @@ type progressWriter struct {
 	totalFiles     int
 	written        int64
 	downloadStatus func(string, string, string, float64)
+	transferSink   TransferProgressSink
 	hash           hash.Hash
+	ctx            context.Context
+}
+
+func (pw *progressWriter) report() {
+	if pw.transferSink != nil {
+		pw.transferSink(TransferProgress{
+			FileName: pw.fileName,
+			Written:  pw.written,
+			Total:    pw.total,
+		})
+	}
+	if pw.downloadStatus == nil {
+		return
+	}
+	percentage := float64(0)
+	total := ""
+	if pw.total > 0 {
+		percentage = float64(pw.written) / float64(pw.total) * 100
+		total = formatBytes(pw.total)
+		if pw.totalFiles > 1 {
+			percentage = percentage/float64(pw.totalFiles) + float64(pw.fileNo)*100/float64(pw.totalFiles)
+		}
+	}
+	pw.downloadStatus(pw.fileName, formatBytes(pw.written), total, percentage)
 }
 
 func (pw *progressWriter) Write(p []byte) (n int, err error) {
+	// Check for cancellation before writing
+	if pw.ctx != nil {
+		select {
+		case <-pw.ctx.Done():
+			return 0, pw.ctx.Err()
+		default:
+		}
+	}
+
 	n, err = pw.hash.Write(p)
+	if err != nil {
+		return n, err
+	}
 	pw.written += int64(n)
 
-	if pw.total > 0 {
-		percentage := float64(pw.written) / float64(pw.total) * 100
-		if pw.totalFiles > 1 {
-			// This is a multi-file download
-			// so we need to adjust the percentage
-			// to reflect the progress of the whole download
-			// This is the file pw.fileNo of pw.totalFiles files. We assume that
-			// the files before successfully downloaded.
-			percentage = percentage / float64(pw.totalFiles)
-			if pw.fileNo > 1 {
-				percentage += float64(pw.fileNo-1) * 100 / float64(pw.totalFiles)
-			}
+	// Check for cancellation after writing chunk
+	if pw.ctx != nil {
+		select {
+		case <-pw.ctx.Done():
+			return n, pw.ctx.Err()
+		default:
 		}
-		//log.Debug().Msgf("Downloading %s: %s/%s (%.2f%%)", pw.fileName, formatBytes(pw.written), formatBytes(pw.total), percentage)
-		pw.downloadStatus(pw.fileName, formatBytes(pw.written), formatBytes(pw.total), percentage)
-	} else {
-		pw.downloadStatus(pw.fileName, formatBytes(pw.written), "", 0)
 	}
+
+	pw.report()
 
 	return
 }
